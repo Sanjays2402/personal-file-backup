@@ -4,15 +4,7 @@ A Dropbox-style personal backup: upload a file to an S3 **inbox** bucket and it 
 automatically copied to a **backup** bucket, then you get an email receipt.
 No servers, no cron jobs — pure event-driven serverless.
 
-```mermaid
-flowchart LR
-    You["You upload a file"] --> Inbox["S3 Inbox Bucket<br/>(versioning, SSE-S3, private)"]
-    Inbox -- "s3:ObjectCreated:* event" --> Lambda["Lambda<br/>FileBackupHandler"]
-    Lambda -- "copy_object<br/>(same key)" --> Backup["S3 Backup Bucket<br/>(versioning, SSE-S3, private)"]
-    Lambda -- "email receipt" --> SNS["SNS Topic"]
-    SNS --> Email["Your inbox:<br/>“File Backed Up”"]
-    CloudTrail["CloudTrail<br/>(optional audit)"] -.->|data events| Logs["Trail log bucket"]
-```
+![Architecture](docs/architecture.svg)
 
 ## How it works
 

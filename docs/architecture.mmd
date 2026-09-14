@@ -1,0 +1,7 @@
+flowchart LR
+    You["You upload a file"] --> Inbox["S3 Inbox Bucket<br/>(versioning, SSE-S3, private)"]
+    Inbox -- "s3:ObjectCreated:* event" --> Lambda["Lambda<br/>FileBackupHandler"]
+    Lambda -- "copy_object<br/>(same key)" --> Backup["S3 Backup Bucket<br/>(versioning, SSE-S3, private)"]
+    Lambda -- "email receipt" --> SNS["SNS Topic"]
+    SNS --> Email["Your inbox:<br/>“File Backed Up”"]
+    CloudTrail["CloudTrail<br/>(optional audit)"] -.->|data events| Logs["Trail log bucket"]
