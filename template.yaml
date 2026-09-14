@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Personal File Backup — event-driven backup pipeline. Every object uploaded to
+  the source ("inbox") S3 bucket is automatically copied to a backup bucket,
+  and the owner receives an SNS email receipt.
+
+Parameters:
+  SourceBucketName:
+    Type: String
+    Description: Name of the inbox S3 bucket that uploads land in.
+    AllowedPattern: "(?=^.{3,63}$)(?!^(\\d+\\.)+\\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])\\.)*([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])$)"
+    ConstraintDescription: Must be a valid S3 bucket name.
+  BackupBucketName:
+    Type: String
+    Description: Name of the S3 bucket backups are copied to.
+    AllowedPattern: "(?=^.{3,63}$)(?!^(\\d+\\.)+\\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])\\.)*([a-z0-9]|[a-z0-9][a-z0-9\\-]*[a-z0-9])$)"
+    ConstraintDescription: Must be a valid S3 bucket name.
+  NotificationEmail:
+    Type: String
+    Description: Email address that receives backup receipts (confirm it via the SNS subscription email).
+    AllowedPattern: "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+    ConstraintDescription: Must be a valid email address.
+  EnableCloudTrail:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Set to "true" to also create a CloudTrail trail logging S3 data events
+      (audit trail). This is outside the free tier — the trail's log bucket is
+      the only extra cost. Default off.
+
+Conditions:
+  CreateCloudTrail: !Equals [!Ref EnableCloudTrail, "true"]
+
+Resources:
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BackupBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BackupTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-file-backup"
+      DisplayName: Personal File Backup receipts
+
+  BackupEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref BackupTopic
+
+  FileBackupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-file-backup-handler"
+      Description: Copies new inbox objects to the backup bucket and emails a receipt.
+      Runtime: python3.12
+      Handler: app.handler
+      CodeUri: src/
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          BACKUP_BUCKET_NAME: !Ref BackupBucket
+          SNS_TOPIC_ARN: !Ref BackupTopic
+      Events:
+        InboxUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref SourceBucket
+            Events: s3:ObjectCreated:*
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadInbox
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${SourceBucket.Arn}/*"
+            - Sid: WriteBackup
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutObjectTagging
+              Resource: !Sub "${BackupBucket.Arn}/*"
+            - Sid: SendReceipt
+              Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref BackupTopic
+
+  # --- Optional CloudTrail audit trail (gated by EnableCloudTrail) ---
+  TrailLogBucket:
+    Condition: CreateCloudTrail
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  TrailLogBucketPolicy:
+    Condition: CreateCloudTrail
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailLogBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${TrailLogBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  FileBackupTrail:
+    Condition: CreateCloudTrail
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailLogBucketPolicy
+    Properties:
+      TrailName: !Sub "${AWS::StackName}-file-backup-trail"
+      S3BucketName: !Ref TrailLogBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: false
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub "${SourceBucket.Arn}/"
+                - !Sub "${BackupBucket.Arn}/"
+
+Outputs:
+  SourceBucketName:
+    Description: Inbox bucket — upload files here to trigger a backup.
+    Value: !Ref SourceBucket
+  BackupBucketName:
+    Description: Backup bucket — copies land here.
+    Value: !Ref BackupBucket
+  BackupTopicArn:
+    Description: SNS topic ARN that backup receipts are published to.
+    Value: !Ref BackupTopic
+  FunctionName:
+    Description: Backup handler Lambda function name.
+    Value: !Ref FileBackupFunction
