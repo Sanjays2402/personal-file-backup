@@ -29,9 +29,25 @@ Parameters:
       Set to "true" to also create a CloudTrail trail logging S3 data events
       (audit trail). This is outside the free tier — the trail's log bucket is
       the only extra cost. Default off.
+  NoncurrentVersionExpirationDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    Description: >-
+      After how many days old (non-current) versions in the backup bucket are
+      permanently deleted. Keeps versioning useful without paying for stale
+      copies forever. Set to a very large number to effectively disable.
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN of a KMS key for SSE-KMS encryption of the backup bucket (e.g. an
+      AWS-managed key alias like arn:aws:kms:...:key/... or your own CMK).
+      Leave empty (default) to use simple SSE-S3 (AES-256) encryption.
 
 Conditions:
   CreateCloudTrail: !Equals [!Ref EnableCloudTrail, "true"]
+  UseKmsEncryption: !Not [!Equals [!Ref KmsKeyArn, ""]]
 
 Resources:
   SourceBucket:
@@ -60,8 +76,18 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+              SSEAlgorithm: !If [UseKmsEncryption, "aws:kms", "AES256"]
+              KMSMasterKeyID: !If [UseKmsEncryption, !Ref KmsKeyArn, !Ref "AWS::NoValue"]
             BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: !Ref NoncurrentVersionExpirationDays
+            # Stray multipart uploads from failed CLI/SDK uploads don't cost
+            # anything to leave, but they do clutter — clean them up.
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -95,6 +121,8 @@ Resources:
         Variables:
           BACKUP_BUCKET_NAME: !Ref BackupBucket
           SNS_TOPIC_ARN: !Ref BackupTopic
+          # Empty => SSE-S3 (AES256); set => SSE-KMS with this key.
+          SSEKMS_KEY_ID: !If [UseKmsEncryption, !Ref KmsKeyArn, ""]
       Events:
         InboxUpload:
           Type: S3
@@ -121,6 +149,20 @@ Resources:
               Action:
                 - sns:Publish
               Resource: !Ref BackupTopic
+        # Only present when KmsKeyArn is set: let the handler encrypt backup
+        # copies with the chosen KMS key.
+        - !If
+          - UseKmsEncryption
+          - Version: "2012-10-17"
+            Statement:
+              - Sid: KmsEncryptBackups
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !Ref KmsKeyArn
+          - !Ref "AWS::NoValue"
 
   # --- Optional CloudTrail audit trail (gated by EnableCloudTrail) ---
   TrailLogBucket:

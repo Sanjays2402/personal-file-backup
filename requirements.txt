@@ -1,0 +1,2 @@
+# Runtime dependencies for the Lambda handler (also used by scripts/).
+boto3>=1.28

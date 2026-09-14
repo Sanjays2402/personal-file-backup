@@ -101,6 +101,51 @@ def test_happy_path_copy_and_notify(mocks):
     assert "12,345 bytes" in pub_kwargs["Message"]
 
 
+def test_receipt_includes_version_id_and_timestamp(mocks):
+    """The email receipt carries the backup version ID and backup time."""
+    _, mock_sns = mocks
+    app.handler(_event(_s3_record()), None)
+
+    message = mock_sns.publish.call_args.kwargs["Message"]
+    assert "Backup version: v1" in message
+    assert "Backed up at  : " in message and "(UTC)" in message
+
+
+def test_receipt_shows_unknown_version_when_missing(mocks):
+    """copy_object without a VersionId (e.g. versioning suspended) -> 'unknown'."""
+    mock_s3, mock_sns = mocks
+    mock_s3.copy_object.return_value = {}
+
+    app.handler(_event(_s3_record()), None)
+
+    message = mock_sns.publish.call_args.kwargs["Message"]
+    assert "Backup version: unknown" in message
+
+
+def test_default_encryption_is_sse_s3(mocks, monkeypatch):
+    mock_s3, _ = mocks
+    monkeypatch.setattr(app, "SSEKMS_KEY_ID", "")
+
+    app.handler(_event(_s3_record()), None)
+
+    kwargs = mock_s3.copy_object.call_args.kwargs
+    assert kwargs["ServerSideEncryption"] == "AES256"
+    assert "SSEKMSKeyId" not in kwargs
+
+
+def test_kms_encryption_used_when_key_configured(mocks, monkeypatch):
+    """SSEKMS_KEY_ID env set -> copies use SSE-KMS with that key."""
+    mock_s3, _ = mocks
+    monkeypatch.setattr(app, "SSEKMS_KEY_ID",
+                        "arn:aws:kms:us-west-2:123:key/abcd-1234")
+
+    app.handler(_event(_s3_record()), None)
+
+    kwargs = mock_s3.copy_object.call_args.kwargs
+    assert kwargs["ServerSideEncryption"] == "aws:kms"
+    assert kwargs["SSEKMSKeyId"] == "arn:aws:kms:us-west-2:123:key/abcd-1234"
+
+
 def test_backup_tags_identify_source_and_time(mocks):
     mock_s3, _ = mocks
     app.handler(_event(_s3_record()), None)
@@ -256,7 +301,14 @@ def test_template_buckets_hardened():
         props = tpl["Resources"][bucket_name]["Properties"]
         assert props["VersioningConfiguration"]["Status"] == "Enabled"
         sse = props["BucketEncryption"]["ServerSideEncryptionConfiguration"][0]
-        assert sse["ServerSideEncryptionByDefault"]["SSEAlgorithm"] == "AES256"
+        algo = sse["ServerSideEncryptionByDefault"]["SSEAlgorithm"]
+        if bucket_name == "SourceBucket":
+            assert algo == "AES256"
+        else:
+            # Backup bucket: SSE-S3 by default, SSE-KMS when KmsKeyArn is set.
+            assert algo == {"Fn::Intrinsic": {
+                "tag": "!If",
+                "value": ["UseKmsEncryption", "aws:kms", "AES256"]}}
         pab = props["PublicAccessBlockConfiguration"]
         assert all(pab[k] for k in
                    ("BlockPublicAcls", "BlockPublicPolicy",
@@ -272,9 +324,53 @@ def test_template_function_wiring():
     assert events["Events"] == "s3:ObjectCreated:*"
     env = fn["Environment"]["Variables"]
     assert "BACKUP_BUCKET_NAME" in env and "SNS_TOPIC_ARN" in env
-    # Least privilege: no wildcards in any policy statement.
+    # Least privilege: no wildcards in any policy statement. Some policy
+    # entries are wrapped in Fn::If (the KMS policy is conditional) — unwrap
+    # the true-branch before checking.
     for policy in fn["Policies"]:
+        if "Fn::Intrinsic" in policy and policy["Fn::Intrinsic"]["tag"] == "!If":
+            policy = policy["Fn::Intrinsic"]["value"][1]  # true-branch policy
         for stmt in policy["Statement"]:
             for key in ("Action", "Resource"):
                 values = stmt[key] if isinstance(stmt[key], list) else [stmt[key]]
                 assert "*" not in values, f"wildcard found in {key}: {values}"
+
+
+def test_template_lifecycle_expires_noncurrent_versions():
+    tpl = _load_template()
+    rules = tpl["Resources"]["BackupBucket"]["Properties"]["LifecycleConfiguration"]["Rules"]
+    expire = next(r for r in rules if r["Id"] == "ExpireNoncurrentVersions")
+    assert expire["Status"] == "Enabled"
+    # Default parameter value is 90 days.
+    param = tpl["Parameters"]["NoncurrentVersionExpirationDays"]
+    assert param["Default"] == 90
+    # The rule references the parameter (via Ref), not a hard-coded number.
+    rule_days = expire["NoncurrentVersionExpirationInDays"]
+    assert rule_days == {"Fn::Intrinsic": {"tag": "!Ref",
+                                           "value": "NoncurrentVersionExpirationDays"}}
+
+
+def test_template_kms_is_optional():
+    """Default (empty KmsKeyArn) keeps SSE-S3; setting it switches to SSE-KMS."""
+    tpl = _load_template()
+    assert tpl["Parameters"]["KmsKeyArn"]["Default"] == ""
+    assert "UseKmsEncryption" in tpl["Conditions"]
+
+    sse = tpl["Resources"]["BackupBucket"]["Properties"]["BucketEncryption"][
+        "ServerSideEncryptionConfiguration"][0]["ServerSideEncryptionByDefault"]
+    algo = sse["SSEAlgorithm"]
+    assert algo["Fn::Intrinsic"]["tag"] == "!If"
+    _cond, true_val, false_val = algo["Fn::Intrinsic"]["value"]
+    assert true_val == "aws:kms" and false_val == "AES256"
+
+    # The handler gets the key via env; the conditional IAM policy grants
+    # kms:Encrypt only when a key is configured.
+    env = tpl["Resources"]["FileBackupFunction"]["Properties"]["Environment"]["Variables"]
+    assert "SSEKMS_KEY_ID" in env
+    policies = tpl["Resources"]["FileBackupFunction"]["Properties"]["Policies"]
+    conditional = [p for p in policies
+                   if p.get("Fn::Intrinsic", {}).get("tag") == "!If"]
+    assert len(conditional) == 1
+    statements = conditional[0]["Fn::Intrinsic"]["value"][1]["Statement"]
+    actions = [a for s in statements for a in s["Action"]]
+    assert "kms:Encrypt" in actions

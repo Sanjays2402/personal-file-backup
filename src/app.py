@@ -29,6 +29,8 @@ SERVICE = "personal-file-backup"
 
 BACKUP_BUCKET_NAME = os.environ.get("BACKUP_BUCKET_NAME", "")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+# Empty string => SSE-S3 (AES256); otherwise SSE-KMS with this key ID/ARN.
+SSEKMS_KEY_ID = os.environ.get("SSEKMS_KEY_ID", "")
 
 
 # Lazily-created clients: boto3.client() must not run at import time (its
@@ -86,6 +88,13 @@ def _object_size(source_bucket: str, key: str) -> int | None:
     return head.get("ContentLength")
 
 
+def _encryption_kwargs() -> dict:
+    """SSE params for copy_object: SSE-KMS when a key is configured, else SSE-S3."""
+    if SSEKMS_KEY_ID:
+        return {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": SSEKMS_KEY_ID}
+    return {"ServerSideEncryption": "AES256"}
+
+
 def _copy_object(source_bucket: str, key: str) -> tuple[str, str | None]:
     """Copy the object into the backup bucket; raises on any failure."""
     copied_at = _now_iso()
@@ -101,7 +110,7 @@ def _copy_object(source_bucket: str, key: str) -> tuple[str, str | None]:
             TaggingDirective="REPLACE",
             Tagging=tags,
             MetadataDirective="COPY",
-            ServerSideEncryption="AES256",
+            **_encryption_kwargs(),
         )
     except Exception as exc:  # noqa: BLE001 - must surface for retry
         _log("copy_failed", source_bucket=source_bucket, key=key,
@@ -113,9 +122,11 @@ def _copy_object(source_bucket: str, key: str) -> tuple[str, str | None]:
     return copied_at, version_id
 
 
-def _notify(source_bucket: str, key: str, size: int | None, copied_at: str) -> None:
+def _notify(source_bucket: str, key: str, size: int | None,
+            copied_at: str, version_id: str | None) -> None:
     """Publish the SNS email receipt; raises on any failure."""
     size_line = f"{size:,} bytes" if size is not None else "unknown"
+    version_line = version_id if version_id else "unknown"
     message = (
         "Your file was backed up successfully.\n"
         "\n"
@@ -123,6 +134,7 @@ def _notify(source_bucket: str, key: str, size: int | None, copied_at: str) -> N
         f"Backup bucket : {BACKUP_BUCKET_NAME}\n"
         f"Key           : {key}\n"
         f"Size          : {size_line}\n"
+        f"Backup version: {version_line}\n"
         f"Backed up at  : {copied_at} (UTC)\n"
     )
     try:
@@ -138,7 +150,7 @@ def _process_record(record: dict) -> dict:
     source_bucket, key = _parse_record(record)
     size = _object_size(source_bucket, key)
     copied_at, version_id = _copy_object(source_bucket, key)
-    _notify(source_bucket, key, size, copied_at)
+    _notify(source_bucket, key, size, copied_at, version_id)
     return {
         "key": key,
         "source_bucket": source_bucket,
