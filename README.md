@@ -158,14 +158,3 @@ The optional CloudTrail data-event logging is the only paid component.
 - **Object Lock**: enable compliance mode on the backup bucket for ransomware-proof copies.
 - **Weekly digest**: a scheduled Lambda summarizing backup counts instead of per-file emails.
 
-## Portfolio deliverables checklist
-
-- [ ] Screenshot: inbox bucket + backup bucket object lists after a test upload
-- [ ] Screenshot: backup object **Properties** → tags (`copied-from`, `copied-at`) and SSE-S3 encryption
-- [ ] Screenshot: CloudWatch log stream showing the `{"event":"copied"}` JSON line
-- [ ] Screenshot: the *"File Backed Up"* SNS email in your inbox
-- [ ] (Optional) Screenshot: CloudTrail event record for a backup data event
-- [ ] GitHub repo with this code + README covering architecture, steps, tests, costs, enhancements
-- [ ] Resume bullet: *"Built an event-driven AWS backup pipeline (S3, Lambda, SNS) with
-      idempotent retries, least-privilege IAM, and optional CloudTrail audit logging — $0/month on the free tier"*
-- [ ] LinkedIn post one-liner with the architecture diagram and repo link
