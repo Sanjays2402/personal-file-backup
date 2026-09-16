@@ -252,6 +252,46 @@ def test_head_failure_does_not_block_backup(mocks):
     assert "unknown" in mock_sns.publish.call_args.kwargs["Message"]
 
 
+def test_integrity_verified_when_etags_match(mocks, capsys):
+    """copy_object's CopyObjectResult.ETag equals the source ETag -> verified, no error."""
+    mock_s3, _ = mocks
+    etag = '"d41d8cd98f00b204e9800998ecf8427e"'
+    mock_s3.head_object.return_value = {"ContentLength": 12345, "ETag": etag}
+    mock_s3.copy_object.return_value = {
+        "VersionId": "v1", "CopyObjectResult": {"ETag": etag}}
+
+    app.handler(_event(_s3_record()), None)
+
+    assert "integrity_verified" in capsys.readouterr().out
+
+
+def test_integrity_mismatch_raises_for_retry(mocks, capsys):
+    """Backup ETag differs from the source -> raise (event retries), no email."""
+    mock_s3, mock_sns = mocks
+    mock_s3.head_object.return_value = {
+        "ContentLength": 12345, "ETag": '"src-etag"'}
+    mock_s3.copy_object.return_value = {
+        "VersionId": "v1", "CopyObjectResult": {"ETag": '"different-etag"'}}
+
+    with pytest.raises(RuntimeError, match="1/1 record\\(s\\) failed"):
+        app.handler(_event(_s3_record()), None)
+
+    mock_sns.publish.assert_not_called()
+    out = capsys.readouterr().out
+    assert "integrity_mismatch" in out
+
+
+def test_integrity_check_skipped_when_etag_unavailable(mocks):
+    """No CopyObjectResult ETag (or head failed) -> check skipped, backup proceeds."""
+    mock_s3, _ = mocks
+    mock_s3.head_object.return_value = {"ContentLength": 12345}
+    mock_s3.copy_object.return_value = {"VersionId": "v1"}
+
+    result = app.handler(_event(_s3_record()), None)
+
+    assert len(result["copied"]) == 1  # no integrity error raised
+
+
 def test_malformed_record_raises(mocks):
     with pytest.raises(RuntimeError, match="record\\(s\\) failed"):
         app.handler(_event({"nope": "not-an-s3-record"}), None)

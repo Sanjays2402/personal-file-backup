@@ -14,6 +14,10 @@ No servers, no cron jobs — pure event-driven serverless.
    original metadata, and server-side encryption (SSE-S3 by default, or SSE-KMS
    with your key — see Deploy), and tags it with
    `copied-from=<inbox>` and `copied-at=<timestamp>`.
+   It then **verifies copy integrity**: the `ETag` returned by the copy must
+   match the source object's `ETag`. A mismatch raises, so the S3 event
+   retries the record (the retry is idempotent) and a corrupt copy never
+   slips through silently.
 4. The Lambda **publishes an SNS email** — *"File Backed Up"* — with bucket,
    key, size, backup version ID, and backup time.
 5. Any copy/notify failure **raises**, so the S3 event retries the record
@@ -151,7 +155,6 @@ The optional CloudTrail data-event logging is the only paid component.
 
 ## Enhancement ideas
 
-- **Integrity check**: compare ETags of source and backup after copy; alert on mismatch.
 - **Prefix filters**: only back up certain prefixes (e.g. `photos/`) via the S3 event filter.
 - **Dead-letter queue**: route repeated failures to an SQS DLQ instead of relying on S3 retries.
 - **Cross-region replication**: add CRR on the backup bucket for region-level durability.

@@ -10,6 +10,8 @@ Design notes
   silently skipped.
 * Copies are idempotent — reprocessing the same record (duplicate events,
   retries) simply overwrites the same backup key, so retries are safe.
+* Post-copy integrity check: the ``CopyObjectResult.ETag`` must match the
+  source object's ETag; a mismatch raises so the S3 event retries the record.
 * All logs are single-line structured JSON for CloudWatch Logs Insights.
 * Object metadata is preserved (MetadataDirective=COPY); we add S3 tags
   ``copied-from`` / ``copied-at`` so a backup object is always traceable
@@ -77,15 +79,20 @@ def _parse_record(record: dict) -> tuple[str, str]:
     return bucket, urllib.parse.unquote_plus(raw_key)
 
 
-def _object_size(source_bucket: str, key: str) -> int | None:
-    """Best-effort size lookup for the receipt email; backup must not depend on it."""
+def _source_object_info(source_bucket: str, key: str) -> tuple[int | None, str | None]:
+    """Best-effort HEAD of the source object: ``(size, ETag)``.
+
+    The size feeds the receipt email; the ETag is the baseline for the
+    post-copy integrity check. Either may be None; the backup must not
+    depend on this call succeeding.
+    """
     try:
         head = s3().head_object(Bucket=source_bucket, Key=key)
     except Exception as exc:  # noqa: BLE001 - logged, non-fatal
         _log("head_failed", source_bucket=source_bucket, key=key,
              error=str(exc), error_type=type(exc).__name__)
-        return None
-    return head.get("ContentLength")
+        return None, None
+    return head.get("ContentLength"), head.get("ETag")
 
 
 def _encryption_kwargs() -> dict:
@@ -95,8 +102,15 @@ def _encryption_kwargs() -> dict:
     return {"ServerSideEncryption": "AES256"}
 
 
-def _copy_object(source_bucket: str, key: str) -> tuple[str, str | None]:
-    """Copy the object into the backup bucket; raises on any failure."""
+def _copy_object(source_bucket: str, key: str,
+                 source_etag: str | None = None) -> tuple[str, str | None]:
+    """Copy the object into the backup bucket; raises on any failure.
+
+    Verifies copy integrity when both ETags are available: the
+    ``CopyObjectResult.ETag`` must match the source object's ETag. A
+    mismatch raises so the S3 event retries the record — reprocessing is
+    idempotent, so a corrupt backup can never slip through silently.
+    """
     copied_at = _now_iso()
     tags = (
         "copied-from=" + urllib.parse.quote(source_bucket, safe="")
@@ -116,6 +130,15 @@ def _copy_object(source_bucket: str, key: str) -> tuple[str, str | None]:
         _log("copy_failed", source_bucket=source_bucket, key=key,
              error=str(exc), error_type=type(exc).__name__)
         raise
+    copy_etag = (response.get("CopyObjectResult") or {}).get("ETag")
+    if source_etag and copy_etag and source_etag != copy_etag:
+        _log("integrity_mismatch", source_bucket=source_bucket, key=key,
+             source_etag=source_etag, backup_etag=copy_etag)
+        raise RuntimeError(
+            f"ETag mismatch after copy: source={source_etag} backup={copy_etag}"
+        )
+    if source_etag and copy_etag:
+        _log("integrity_verified", key=key, etag=copy_etag)
     version_id = response.get("VersionId")
     _log("copied", source_bucket=source_bucket, backup_bucket=BACKUP_BUCKET_NAME,
          key=key, version_id=version_id, copied_at=copied_at)
@@ -148,8 +171,8 @@ def _notify(source_bucket: str, key: str, size: int | None,
 
 def _process_record(record: dict) -> dict:
     source_bucket, key = _parse_record(record)
-    size = _object_size(source_bucket, key)
-    copied_at, version_id = _copy_object(source_bucket, key)
+    size, source_etag = _source_object_info(source_bucket, key)
+    copied_at, version_id = _copy_object(source_bucket, key, source_etag)
     _notify(source_bucket, key, size, copied_at, version_id)
     return {
         "key": key,
